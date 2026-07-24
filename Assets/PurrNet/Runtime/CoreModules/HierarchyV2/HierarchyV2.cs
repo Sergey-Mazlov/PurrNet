@@ -40,6 +40,8 @@ namespace PurrNet.Modules
 
         private bool _areSceneObjectsReady;
 
+        public static System.Func<PlayerID, NetworkIdentity, bool?> isVisibleTo;
+        
         /// <summary>
         /// Invoked to validate the spawning of a client-side object before it is instantiated.
         /// This event allows implementing custom rules to determine whether the object spawn

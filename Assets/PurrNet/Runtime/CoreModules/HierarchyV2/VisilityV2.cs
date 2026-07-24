@@ -236,6 +236,22 @@ namespace PurrNet.Modules
                     identities[i].TryRemoveObserver(player);
                 return false;
             }
+            
+            if (HierarchyV2.isVisibleTo != null && identities.Count > 0)
+            {
+                var result = HierarchyV2.isVisibleTo(player, identities[0]);
+                if (result.HasValue)
+                {
+                    for (var i = 0; i < identities.Count; i++)
+                    {
+                        if (result.Value)
+                            fullyChanged |= identities[i].TryAddObserver(player);
+                        else
+                            fullyChanged |= identities[i].TryRemoveObserver(player);
+                    }
+                    return result.Value;
+                }
+            }
 
             bool isAnyVisible = false;
 
