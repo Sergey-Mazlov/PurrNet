@@ -77,13 +77,13 @@ namespace PurrNet.Packing
         [UsedByIL]
         public static void Write(this BitPacker packer, char value)
         {
-            packer.WriteBits(value, 8);
+            packer.WriteBits(value, 16);
         }
 
         [UsedByIL]
         public static void Read(this BitPacker packer, ref char value)
         {
-            value = (char)packer.ReadBits(8);
+            value = (char)packer.ReadBits(16);
         }
     }
 }
