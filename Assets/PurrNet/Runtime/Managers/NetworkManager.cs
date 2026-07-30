@@ -1138,6 +1138,8 @@ namespace PurrNet
             }
         }
 
+        public static event Action<NetworkManager, ModulesCollection, bool> onRegisterCustomModules;
+        
         public void RegisterModules(ModulesCollection modules, bool asServer)
         {
             switch (asServer)
@@ -1333,6 +1335,8 @@ namespace PurrNet
             }
 #endif
 
+            onRegisterCustomModules?.Invoke(this, modules, asServer);
+            
             RenewSubscriptions(asServer);
         }
 
