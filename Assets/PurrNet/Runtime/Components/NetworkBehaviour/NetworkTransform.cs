@@ -172,24 +172,6 @@ namespace PurrNet
             set => ApplyAdaptiveLevelInternal(value);
         }
 
-        public int MaxBufferSize
-        {
-            get => _maxBufferSize;
-            set
-            {
-                _maxBufferSize = Mathf.Max(value, _minBufferSize);
-                
-                if (_position != null) 
-                    _position.maxBufferSize = _maxBufferSize;
-                
-                if (_rotation != null) 
-                    _rotation.maxBufferSize = _maxBufferSize;
-                
-                if (_scale != null) 
-                    _scale.maxBufferSize = _maxBufferSize;
-            }
-        }
-        
         private void ApplyAdaptiveLevelInternal(AdaptiveSyncLevel level)
         {
             if (_adaptiveSynchronization == level)
