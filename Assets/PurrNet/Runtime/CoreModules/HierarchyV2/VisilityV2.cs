@@ -289,12 +289,12 @@ namespace PurrNet.Modules
                 return false;
             }
             
-            if (HierarchyV2.isVisibleTo != null && identities.Count > 0)
+            if (HierarchyV2.isVisibleTo != null && identities.Length > 0)
             {
                 var result = HierarchyV2.isVisibleTo(player, identities[0]);
                 if (result.HasValue)
                 {
-                    for (var i = 0; i < identities.Count; i++)
+                    for (var i = 0; i < identities.Length; i++)
                     {
                         if (result.Value)
                             fullyChanged |= identities[i].TryAddObserver(player);
