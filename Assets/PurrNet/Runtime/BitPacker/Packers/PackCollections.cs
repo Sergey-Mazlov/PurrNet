@@ -400,14 +400,31 @@ namespace PurrNet.Packing
 
         private static bool WriteDeltaList<T>(BitPacker packer, IList<T> oldvalue, IList<T> newvalue)
         {
-            bool areEqual = Packer.AreEqual(oldvalue, newvalue);
+            bool areEqual = AreListsEqual(oldvalue, newvalue);
 
             Packer<bool>.Write(packer, areEqual);
 
             if (!areEqual)
                 WriteList(packer, newvalue);
 
-            return areEqual;
+            return !areEqual;
+        }
+
+        private static bool AreListsEqual<T>(IList<T> x, IList<T> y)
+        {
+            if (ReferenceEquals(x, y)) return true;
+            if (x == null || y == null) return false;
+            if (x.Count != y.Count) return false;
+
+            var elementEquality = PurrEquality<T>.Default;
+
+            for (int i = 0; i < x.Count; i++)
+            {
+                if (!elementEquality.Equals(x[i], y[i]))
+                    return false;
+            }
+
+            return true;
         }
 
         private static void ReadDeltaArray<T>(BitPacker packer, T[] oldvalue, ref T[] value)
