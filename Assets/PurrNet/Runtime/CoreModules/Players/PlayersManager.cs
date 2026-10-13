@@ -1,6 +1,5 @@
 using System;
 using System.Collections.Generic;
-using Newtonsoft.Json;
 using PurrNet.Authentication;
 using PurrNet.Logging;
 using PurrNet.Packing;
@@ -12,13 +11,10 @@ namespace PurrNet.Modules
     [Serializable]
     public struct ServerLoginResponse : IPackedAuto
     {
-        [JsonProperty]
         public PlayerID playerId { get; }
 
-        [JsonProperty]
         public NetworkID lastNidId { get; }
 
-        [JsonProperty]
         public string cookie { get; }
 
         public ServerLoginResponse(PlayerID playerId, NetworkID lastNidId, string cookie = null)
@@ -32,16 +28,12 @@ namespace PurrNet.Modules
     [Serializable]
     public struct PlayerJoinedEvent : IPackedAuto
     {
-        [JsonProperty]
         public PlayerID playerId { get; }
 
-        [JsonProperty]
         public Connection connection { get; }
 
-        [JsonProperty]
         public NetworkID? lastNidId { get; }
 
-        [JsonProperty]
         public string cookie { get; }
 
         public PlayerJoinedEvent(PlayerID playerId, Connection connection, NetworkID? lastNid, string cookie)
@@ -56,7 +48,6 @@ namespace PurrNet.Modules
     [Serializable]
     public struct PlayerLeftEvent : IPackedAuto
     {
-        [JsonProperty]
         public PlayerID playerId { get; }
 
         public PlayerLeftEvent(PlayerID playerId)
@@ -68,7 +59,6 @@ namespace PurrNet.Modules
     [Serializable]
     public struct PlayerSnapshotEvent : IPackedAuto
     {
-        [JsonProperty]
         public DisposableList<PlayerJoinedEvent> events { get; }
 
         public PlayerSnapshotEvent(DisposableList<PlayerJoinedEvent> snapshot)
@@ -103,6 +93,7 @@ namespace PurrNet.Modules
         private readonly HashSet<PlayerID> _allSeenPlayers = new HashSet<PlayerID>();
         private readonly HashSet<int> _promotedStaleConnectionIds = new HashSet<int>();
         private PlayerID? _promotedLocalPlayerId;
+        private bool _isPromotingToServer;
 
         public IReadOnlyList<PlayerID> players => _players;
 
@@ -251,6 +242,16 @@ namespace PurrNet.Modules
             return _connectionToPlayerId.TryGetValue(conn, out playerId);
         }
 
+        internal bool TryGetAuthenticatedPlayer(Connection conn, out PlayerID playerId)
+        {
+            if (_asServer && !_isPromotingToServer &&
+                _connectionToPlayerId.TryGetValue(conn, out playerId) && !playerId.isServer)
+                return true;
+
+            playerId = default;
+            return false;
+        }
+
         /// <summary>
         /// Check if a playerId is the local player.
         /// </summary>
@@ -320,6 +321,7 @@ namespace PurrNet.Modules
 
         public void PromoteToServerModule()
         {
+            _isPromotingToServer = true;
             _promotedLocalPlayerId = localPlayerId;
             Disable(false);
             _asServer = true;
@@ -358,11 +360,16 @@ namespace PurrNet.Modules
                     continue;
                 }
 
-                _networkManager.TriggerConnectionLeft(keys[i], true);
+                try
+                {
+                    _networkManager.TriggerConnectionLeft(keys[i], true);
+                }
+                catch (Exception e) { PurrLogger.LogException(e); }
             }
 
             _connectionToPlayerId.Clear();
             _promotedLocalPlayerId = null;
+            _isPromotingToServer = false;
         }
 
         public void Enable(bool asServer)
@@ -646,6 +653,8 @@ namespace PurrNet.Modules
 
         public void OnConnected(Connection conn, bool asServer)
         {
+            if (asServer)
+                _promotedStaleConnectionIds.Remove(conn.connectionId);
         }
 
         public void OnConnectionState(ConnectionState state, bool asServer)

@@ -5,8 +5,18 @@ using UnityEngine;
 namespace PurrNet.Editor
 {
     [CustomEditor(typeof(StatisticsManager), true)]
-    public class StatisticsManagerEditor : UnityEditor.Editor
+    public class StatisticsManagerEditor : OptionalInspector
     {
+        private static readonly string[] _editorAttributesExcludedProperties =
+        {
+            "m_Script", "checkInterval", "placement", "_displayType", "_displayTarget", "fontSize", "textColor",
+            "_highPingThreshold", "_highPingRecoveryThreshold", "_highJitterThreshold", "_highJitterRecoveryThreshold",
+            "_highPacketLossThreshold", "_highPacketLossRecoveryThreshold", "_qualityChangeDuration",
+            "_connectionStallThreshold"
+        };
+
+        protected override string[] editorAttributesExcludedProperties => _editorAttributesExcludedProperties;
+
         private SerializedProperty _scriptProp;
         private SerializedProperty _placementProp;
         private SerializedProperty _displayTypeProp;
@@ -128,6 +138,15 @@ namespace PurrNet.Editor
 
         private void RenderStatistics(StatisticsManager statisticsManager)
         {
+            if (Application.isPlaying)
+            {
+                EditorGUILayout.LabelField("Client connection", statisticsManager.clientConnectionDescription,
+                    EditorStyles.wordWrappedLabel);
+                EditorGUILayout.LabelField("Server connection", statisticsManager.serverConnectionDescription,
+                    EditorStyles.wordWrappedLabel);
+                GUILayout.Space(4);
+            }
+
             if (!statisticsManager.connectedServer && !statisticsManager.connectedClient)
             {
                 EditorGUILayout.LabelField("Awaiting connection");

@@ -1,9 +1,11 @@
 using System;
 using System.Buffers;
+using System.Collections.Generic;
 using System.ComponentModel;
 using PurrNet.Logging;
 using PurrNet.Modules;
 using PurrNet.Packing;
+using PurrNet.Pooling;
 using PurrNet.Utils;
 using Unity.Mathematics;
 using UnityEngine;
@@ -205,6 +207,12 @@ namespace PurrNet
 
         private void OnValidate()
         {
+            if (_frameUpdateList != null)
+            {
+                UnregisterFrameUpdate();
+                RegisterFrameUpdate();
+            }
+
             if (!Application.isPlaying || !isSpawned)
             {
                 _inspectorAdaptiveSync = _adaptiveSynchronization;
@@ -268,6 +276,8 @@ namespace PurrNet
 
         private void ApplyStrategySettings()
         {
+            _resting = false;
+            WakeAdaptiveRender();
             _activeStrategy = _adaptiveSynchronization == AdaptiveSyncLevel.Off
                 ? null
                 : _customStrategy ?? _defaultStrategies[Mathf.Clamp((int)_adaptiveSynchronization, 1, 4) - 1];
@@ -317,6 +327,13 @@ namespace PurrNet
         Interpolated<QuaternionWithParent> _rotation;
         Interpolated<ScaleWithParent> _scale;
 
+        static readonly LerpFunction<Vector3WithParent> _positionLerp = Vector3WithParent.Lerp;
+        static readonly LerpFunction<Vector3WithParent> _positionNoLerp = Vector3WithParent.NoLerp;
+        static readonly LerpFunction<QuaternionWithParent> _rotationLerp = QuaternionWithParent.Lerp;
+        static readonly LerpFunction<QuaternionWithParent> _rotationNoLerp = QuaternionWithParent.NoLerp;
+        static readonly LerpFunction<ScaleWithParent> _scaleLerp = ScaleWithParent.Lerp;
+        static readonly LerpFunction<ScaleWithParent> _scaleNoLerp = ScaleWithParent.NoLerp;
+
         public Vector3 latestReadPosition
         {
             get
@@ -359,10 +376,20 @@ namespace PurrNet
         public Quaternion rotation { get; private set; }
         public Vector3 localScale { get; private set; }
 
-        private Action _onLateLateUpdate;
+        private Action _onFrameUpdate;
 #if UNITY_PHYSICS_3D || UNITY_PHYSICS_2D
         private Action _onLateFixedUpdate;
+        private int _lateFixedUpdateHandle = PurrAction<Action>.InvalidHandle;
 #endif
+        private PurrAction<Action> _frameUpdateList;
+        private int _frameUpdateHandle = PurrAction<Action>.InvalidHandle;
+
+        private bool _resting;
+        private bool _hasRawPose;
+        private bool _latestDirty = true;
+        private Vector3 _rawPosition;
+        private Quaternion _rawRotation;
+        private Vector3 _rawScale;
 
         private bool _positionTransformExplicit;
         private bool _useAbsoluteFrame;
@@ -387,7 +414,7 @@ namespace PurrNet
 
         private void Awake()
         {
-            _onLateLateUpdate = LateLateUpdate;
+            _onFrameUpdate = OnFrameUpdate;
 #if UNITY_PHYSICS_3D || UNITY_PHYSICS_2D
             _onLateFixedUpdate = LateFixedUpdate;
 #endif
@@ -411,9 +438,11 @@ namespace PurrNet
         private void OnEnable()
         {
             CacheCurrentPose();
-            UnityLatestUpdate.onLatestUpdate += _onLateLateUpdate;
+            _resting = false;
+            RegisterFrameUpdate();
 #if UNITY_PHYSICS_3D || UNITY_PHYSICS_2D
-            UnityLatestUpdate.onFixedUpdate += _onLateFixedUpdate;
+            if (hasBody)
+                _lateFixedUpdateHandle = UnityLatestUpdate.fixedUpdate.Add(_onLateFixedUpdate);
 #endif
 
             if (!_trs)
@@ -435,15 +464,56 @@ namespace PurrNet
 
         private void OnDisable()
         {
-            UnityLatestUpdate.onLatestUpdate -= _onLateLateUpdate;
+            UnregisterFrameUpdate();
 #if UNITY_PHYSICS_3D || UNITY_PHYSICS_2D
-            UnityLatestUpdate.onFixedUpdate -= _onLateFixedUpdate;
+            if (_lateFixedUpdateHandle != PurrAction<Action>.InvalidHandle)
+                UnityLatestUpdate.fixedUpdate.RemoveAt(_lateFixedUpdateHandle, _onLateFixedUpdate);
+            _lateFixedUpdateHandle = PurrAction<Action>.InvalidHandle;
 #endif
         }
+
+        private void RegisterFrameUpdate()
+        {
+            _frameUpdateList = _interpolationTiming switch
+            {
+                InterpolationTiming.LateUpdate => UnityUpdate.lateUpdate,
+                InterpolationTiming.LateLateUpdate => UnityLatestUpdate.latestUpdate,
+                _ => UnityUpdate.update
+            };
+            _frameUpdateHandle = _frameUpdateList.Add(_onFrameUpdate);
+        }
+
+        private void UnregisterFrameUpdate()
+        {
+            _frameUpdateList?.RemoveAt(_frameUpdateHandle, _onFrameUpdate);
+            _frameUpdateList = null;
+            _frameUpdateHandle = PurrAction<Action>.InvalidHandle;
+        }
+
+#if UNITY_PHYSICS_3D || UNITY_PHYSICS_2D
+        private bool hasBody
+        {
+            get
+            {
+#if UNITY_PHYSICS_3D
+                if (_hasRigidbody)
+                    return true;
+#endif
+#if UNITY_PHYSICS_2D
+                if (_hasRigidbody2D)
+                    return true;
+#endif
+                return false;
+            }
+        }
+#endif
 
         protected override void OnEarlySpawn()
         {
             _trs = transform;
+            _hasLivePose = false;
+            InvalidateLatest();
+            _resting = false;
             CacheCurrentPose();
             ReCacheIsController();
             ResolvePositionTransform();
@@ -456,8 +526,11 @@ namespace PurrNet
             if (syncPosition)
             {
                 var currentPos = MakePositionSample(p, data);
-                _position = new Interpolated<Vector3WithParent>(interpolatePosition ? Vector3WithParent.Lerp : Vector3WithParent.NoLerp,
-                    sendDelta, currentPos, _maxBufferSize, _minBufferSize);
+                var lerp = interpolatePosition ? _positionLerp : _positionNoLerp;
+
+                if (_position == null)
+                    _position = new Interpolated<Vector3WithParent>(lerp, sendDelta, currentPos, _maxBufferSize, _minBufferSize);
+                else _position.Reset(lerp, sendDelta, currentPos, _maxBufferSize, _minBufferSize);
             }
 
             if (syncRotation)
@@ -465,16 +538,21 @@ namespace PurrNet
                 var currentRot = _syncRotation == SyncMode.World ?
                     new QuaternionWithParent(p, false, _trs.rotation) :
                     new QuaternionWithParent(p, true, _trs.localRotation);
-                _rotation = new Interpolated<QuaternionWithParent>(
-                    interpolateRotation ? QuaternionWithParent.Lerp : QuaternionWithParent.NoLerp,
-                    sendDelta, currentRot, _maxBufferSize, _minBufferSize);
+                var lerp = interpolateRotation ? _rotationLerp : _rotationNoLerp;
+
+                if (_rotation == null)
+                    _rotation = new Interpolated<QuaternionWithParent>(lerp, sendDelta, currentRot, _maxBufferSize, _minBufferSize);
+                else _rotation.Reset(lerp, sendDelta, currentRot, _maxBufferSize, _minBufferSize);
             }
 
             if (syncScale)
             {
                 var currentScale = new ScaleWithParent(p, _trs.localScale);
-                _scale = new Interpolated<ScaleWithParent>(interpolateScale ? ScaleWithParent.Lerp : ScaleWithParent.NoLerp,
-                    sendDelta, currentScale, _maxBufferSize, _minBufferSize);
+                var lerp = interpolateScale ? _scaleLerp : _scaleNoLerp;
+
+                if (_scale == null)
+                    _scale = new Interpolated<ScaleWithParent>(lerp, sendDelta, currentScale, _maxBufferSize, _minBufferSize);
+                else _scale.Reset(lerp, sendDelta, currentScale, _maxBufferSize, _minBufferSize);
             }
 
             _currentData = data;
@@ -532,7 +610,7 @@ namespace PurrNet
             ReCacheIsController();
             BumpSendGen();
 
-            if (isServer)
+            if (asServer)
                 ResetUnreliableRecvState();
 
             if (!enabled)
@@ -625,17 +703,41 @@ namespace PurrNet
         protected override void OnObserverAdded(PlayerID player)
         {
             InvalidateObserverBaseline(player, true);
+        }
 
-            if (!enabled)
-            {
+        protected override void OnObserversAdded(IReadOnlyList<PlayerID> players, bool isSpawner)
+        {
+            if (!enabled || !id.HasValue)
                 return;
+
+            var targets = ListPool<PlayerID>.Instantiate();
+            for (int i = 0; i < players.Count; i++)
+            {
+                var player = players[i];
+                if (player == localPlayer || (_ownerAuth && player == owner))
+                    continue;
+                targets.Add(player);
             }
 
-            if (player == localPlayer)
-                return;
+            if (targets.Count == 1)
+            {
+                SendLatestState(targets[0], currentState, true, _sendGen);
+            }
+            else if (targets.Count > 1)
+            {
+                if (networkManager.TryGetModule<NetworkTransformFactory>(isServer, out var factory) &&
+                    factory.TryGetModule(sceneId, out var ntModule))
+                {
+                    ntModule.SendInitialState(targets, id.Value, currentState, _sendGen);
+                }
+                else
+                {
+                    for (int i = 0; i < targets.Count; i++)
+                        SendLatestState(targets[i], currentState, true, _sendGen);
+                }
+            }
 
-            if (!_ownerAuth || player != owner)
-                SendLatestState(player, currentState, true, _sendGen);
+            ListPool<PlayerID>.Destroy(targets);
         }
 
         protected override void OnObserverRemoved(PlayerID player)
@@ -731,10 +833,19 @@ namespace PurrNet
 
         /// <summary>
         /// Clears interpolation and teleports the transform to the target position, rotation and scale.
-        /// Works on both owner and non-owner clients.
+        /// Works on both owner and non-owner clients. Also cancels any in-flight seam blending
+        /// (e.g. from an ownership handoff) so the snap is not smoothed away.
         /// </summary>
         public void ClearInterpolation(Vector3? targetPos, Quaternion? targetRot, Vector3? targetScale)
         {
+            _resting = false;
+            _hasCorrOffset = false;
+            _corrPending = false;
+            _hasPrevAnchor = false;
+            _hasCorrPrevTarget = false;
+            _hasLastSample = false;
+            _seamOffset = Vector3.zero;
+
             var p = _trs.parent;
             if (syncPosition && targetPos.HasValue)
             {
@@ -759,6 +870,15 @@ namespace PurrNet
             if (!ForceAdoptRecvGen(gen))
                 return;
 
+            if (_hasStrategy && !_cachedIsController && _hasLivePose)
+            {
+                // Teleporting to the new owner's render-delayed pose would bake a rewind into
+                // the relayed stream; keep rendering from the current pose instead. The stream
+                // stays continuous, so observer baselines stay valid without a gen bump.
+                _lastReadData = state.data;
+                return;
+            }
+
             BumpSendGen();
             AdoptState(state);
             _lastSentDelta = state.data;
@@ -777,7 +897,12 @@ namespace PurrNet
             if (!ForceAdoptRecvGen(gen))
                 return false;
 
+            // Adopting on the controller would briefly replace the outgoing capture with a stale pose.
+            if (_cachedIsController)
+                return true;
+
             AdoptState(state);
+            _hasLivePose = true;
 
             if (applyPosition)
             {
@@ -806,7 +931,10 @@ namespace PurrNet
 #if UNITY_PHYSICS_3D
         private void StabilizeObserverRigidbody()
         {
-            if (_cachedIsController || !_hasRigidbody)
+            if (_cachedIsController || !_hasRigidbody || !_rb)
+                return;
+
+            if (_resting && _rb.IsSleeping())
                 return;
 
             var targetPosition = syncPosition ? ResolveNetworkPosePosition() : position;
@@ -814,6 +942,9 @@ namespace PurrNet
 
             ApplyObserverRigidbodyPose(
                 _rb, syncPosition, targetPosition, syncRotation, targetRotation);
+
+            if (_resting && !_rb.isKinematic)
+                _rb.Sleep();
         }
 
         internal static void ApplyObserverRigidbodyPose(
@@ -864,11 +995,17 @@ namespace PurrNet
             if (_cachedIsController || !_hasRigidbody2D || !_rb2d)
                 return;
 
+            if (_resting && _rb2d.IsSleeping())
+                return;
+
             var targetPosition = syncPosition ? ResolveNetworkPosePosition() : position;
             var targetRotation = syncRotation ? ResolveNetworkPoseRotation() : rotation;
 
             ApplyObserverRigidbodyPose(
                 _rb2d, syncPosition, targetPosition, syncRotation, targetRotation);
+
+            if (_resting && _rb2d.bodyType == RigidbodyType2D.Dynamic)
+                _rb2d.Sleep();
         }
 
         private static void ApplyObserverRigidbodyPose(
@@ -918,10 +1055,9 @@ namespace PurrNet
         }
 #endif
 
-        private void Update()
+        private void OnFrameUpdate()
         {
-            if (_interpolationTiming == InterpolationTiming.Update)
-                UpdateNT();
+            UpdateNT();
 
             if (_adaptiveDebugDump && _trs)
             {
@@ -931,21 +1067,20 @@ namespace PurrNet
             }
         }
 
-        private void LateUpdate()
-        {
-            if (_interpolationTiming == InterpolationTiming.LateUpdate)
-                UpdateNT();
-        }
-
-        private void LateLateUpdate()
-        {
-            if (_interpolationTiming == InterpolationTiming.LateLateUpdate)
-                UpdateNT();
-        }
-
         private void OnIsControlledChanged(bool isController)
         {
-            if (!isController)
+            _resting = false;
+            InvalidateLatest();
+            WakeAdaptiveRender();
+
+            if (isController)
+            {
+                _hasLivePose = true;
+                // The receive pipeline is inert while controlling; stale anchors and history
+                // must not survive into a later return to observer rendering.
+                ResetUnreliableRecvState();
+            }
+            else
             {
                 _latestData = GetCurrentTransformData();
                 RefreshLatestFrame();
@@ -1013,9 +1148,56 @@ namespace PurrNet
             bool isLocalController = _cachedIsController;
 
             if (!isLocalController)
+            {
+                if (_resting && IsRawPoseUnchanged())
+                    return;
+
+                _resting = false;
                 ApplyLerpedPosition();
-            _latestData = GetCurrentTransformData();
-            RefreshLatestFrame();
+            }
+
+            RefreshLatestData();
+
+            if (!isLocalController)
+                _resting = IsInterpolationSettled();
+        }
+
+        private bool IsRawPoseUnchanged()
+        {
+            ReadRawPose(out var pos, out var rot, out var scale);
+            return _hasRawPose && pos.Equals(_rawPosition) && rot.Equals(_rawRotation) && scale.Equals(_rawScale);
+        }
+
+        private void InvalidateLatest()
+        {
+            _hasRawPose = false;
+            _latestDirty = true;
+        }
+
+        private void RefreshLatestData()
+        {
+            ReadRawPose(out var pos, out var rot, out var scale);
+
+            if (_hasRawPose && !_useAbsoluteFrame && pos.Equals(_rawPosition) && rot.Equals(_rawRotation) &&
+                scale.Equals(_rawScale))
+                return;
+
+            _rawPosition = pos;
+            _rawRotation = rot;
+            _rawScale = scale;
+            _hasRawPose = true;
+            _latestDirty = true;
+            _latestData = BuildTransformData(pos, rot, scale);
+        }
+
+        private bool IsInterpolationSettled()
+        {
+            if (TryResolvePositionTransform(out _))
+                return false;
+
+            return (!syncPosition || _position.bufferSize == 0) &&
+                   (!syncRotation || _rotation.bufferSize == 0) &&
+                   (!syncScale || _scale.bufferSize == 0);
         }
 
         private void ApplyLerpedPosition()
@@ -1127,9 +1309,12 @@ namespace PurrNet
 
         private NetworkTransformData GetCurrentTransformData()
         {
-            Vector3 pos;
-            Quaternion rot;
+            ReadRawPose(out var pos, out var rot, out var scale);
+            return BuildTransformData(pos, rot, scale);
+        }
 
+        private void ReadRawPose(out Vector3 pos, out Quaternion rot, out Vector3 scale)
+        {
             if (_syncPosition == _syncRotation)
             {
                 switch (_syncPosition)
@@ -1164,16 +1349,22 @@ namespace PurrNet
                 };
             }
 
-            var ntScale = _syncScale ? _trs.localScale : default;
+            scale = _syncScale ? _trs.localScale : default;
+        }
 
+        private NetworkTransformData BuildTransformData(Vector3 pos, Quaternion rot, Vector3 scale)
+        {
             if (_useAbsoluteFrame)
-                return new NetworkTransformData(null, positionTransform.ToAbsolute(this, pos), rot, ntScale);
+                return new NetworkTransformData(null, positionTransform.ToAbsolute(this, pos), rot, scale);
 
-            return new NetworkTransformData((CompressedVector3)pos, null, rot, ntScale);
+            return new NetworkTransformData((CompressedVector3)pos, null, rot, scale);
         }
 
         void OnTransformParentChanged()
         {
+            _resting = false;
+            InvalidateLatest();
+
             if (!isSpawned)
                 return;
 
@@ -1223,6 +1414,7 @@ namespace PurrNet
 
         private void TeleportToData(NetworkTransformData data)
         {
+            _resting = false;
             var p = _trs.parent;
 
             if (syncPosition)
@@ -1277,6 +1469,32 @@ namespace PurrNet
 
         internal uint sendGenEpoch => _sendGenEpoch;
 
+        internal NTEncodeCache unreliableEncodeCache;
+
+        internal int ntIndex = -1;
+
+        internal NetworkID ntNid;
+
+        internal bool ntRegistered;
+
+        internal int ntServerIndex = -1;
+
+        internal int GetNTIndex(bool asServer) => asServer ? ntServerIndex : ntIndex;
+
+        internal void SetNTIndex(bool asServer, int index)
+        {
+            if (asServer)
+                ntServerIndex = index;
+            else
+                ntIndex = index;
+        }
+
+        internal void PromoteNTRegistrationToServer()
+        {
+            ntServerIndex = ntIndex;
+            ntIndex = -1;
+        }
+
         private void BumpSendGen()
         {
             _sendGen++;
@@ -1317,6 +1535,8 @@ namespace PurrNet
         private ushort _lastAppliedSenderTick;
         private bool _hasLastAppliedState;
 
+        private bool _hasLivePose;
+
         private const float CORRECTION_DECAY = 0.65f;
         private const float RENDER_RATE_GAIN = 0.2f;
         private const float RENDER_RATE_MAX_SLOWDOWN = 0.5f;
@@ -1334,6 +1554,8 @@ namespace PurrNet
         private NetworkID _corrParentId;
         private bool _hasCorrOffset;
         private bool _corrPending;
+        private double3 _corrPrevTarget;
+        private bool _hasCorrPrevTarget;
 
         private NetworkTransformState _anchorState;
         private NetworkTransformVelocity _anchorVelocity;
@@ -1348,9 +1570,21 @@ namespace PurrNet
 
         private uint _lastAdaptiveTick;
 
+        private bool _adaptiveResting;
+        private NetworkTransformState _lastAdaptiveOutput;
+        private bool _hasLastAdaptiveOutput;
+
+        internal bool needsAdaptiveRender => _hasStrategy && !_cachedIsController && _hasAdaptiveAnchor && !_adaptiveResting;
+
+        private void WakeAdaptiveRender()
+        {
+            _adaptiveResting = false;
+            _hasLastAdaptiveOutput = false;
+        }
+
         private const int RECV_HISTORY_SIZE = 32;
 
-        private NetworkTransformState[] _recvStates;
+        [System.NonSerialized] private NetworkTransformState[] _recvStates;
         private ushort[] _recvTicks;
         private int _recvCount;
         private int _recvHead;
@@ -1486,6 +1720,7 @@ namespace PurrNet
 
         private void ClearAdaptiveAnchors()
         {
+            WakeAdaptiveRender();
             _hasAdaptiveAnchor = false;
             _hasPrevAnchor = false;
             _recvCount = 0;
@@ -1493,11 +1728,13 @@ namespace PurrNet
             _hasRenderTimeline = false;
             _hasCorrOffset = false;
             _corrPending = false;
+            _hasCorrPrevTarget = false;
             _seamOffset = Vector3.zero;
         }
 
         private void SetAdaptiveAnchor(in NetworkTransformState state, in NetworkTransformVelocity velocity)
         {
+            WakeAdaptiveRender();
             var nm = networkManager;
             uint localTick = nm && nm.tickModule != null ? nm.tickModule.localTick : 0u;
 
@@ -1555,6 +1792,12 @@ namespace PurrNet
 
         internal static string DebugPos(in NetworkTransformState state)
         {
+            if (state.data.absolutePosition.HasValue)
+            {
+                var a = state.data.absolutePosition.Value;
+                return $"abs:{a.x:F4}|{a.y:F4}|{a.z:F4}";
+            }
+
             var p = state.data.position;
             return p.HasValue ? $"{p.Value.x.value:F4}|{p.Value.y.value:F4}|{p.Value.z.value:F4}" : "na";
         }
@@ -1598,7 +1841,7 @@ namespace PurrNet
         {
             state = default;
 
-            if (!_hasStrategy || _cachedIsController || !_hasAdaptiveAnchor)
+            if (!_hasStrategy || _cachedIsController || !_hasAdaptiveAnchor || _adaptiveResting)
                 return false;
 
             if (_lastAdaptiveTick == localTick)
@@ -1690,8 +1933,46 @@ namespace PurrNet
 
             if (_hasCorrOffset)
             {
+                float posStep = 0f;
+                double3 curTarget = default;
+                bool hasCurTarget = true;
+
+                if (target.data.position.HasValue)
+                {
+                    var tp = target.data.position.Value;
+                    curTarget = new double3(tp.x.value, tp.y.value, tp.z.value);
+                }
+                else if (target.data.absolutePosition.HasValue)
+                {
+                    curTarget = target.data.absolutePosition.Value;
+                }
+                else
+                {
+                    hasCurTarget = false;
+                }
+
+                if (hasCurTarget)
+                {
+                    if (_hasCorrPrevTarget)
+                        posStep = (float)math.length(curTarget - _corrPrevTarget);
+                    _corrPrevTarget = curTarget;
+                    _hasCorrPrevTarget = true;
+                }
+
+                // Cap the shrink at the target's own speed so a seam slows the render down
+                // instead of playing the motion backwards.
+                var nmc = networkManager;
+                float corrTickDelta = nmc && nmc.tickModule != null ? nmc.tickModule.tickDelta : 1f / 30f;
+                float posCap = Mathf.Max(posStep, corrTickDelta * 0.25f);
+                float posMag = _corrPosOffset.magnitude;
+                if (posMag > 0f)
+                {
+                    float shrink = Mathf.Min(posMag * (1f - CORRECTION_DECAY), posCap);
+                    _corrPosOffset *= (posMag - shrink) / posMag;
+                }
+
                 _corrWeight *= CORRECTION_DECAY;
-                if (_corrWeight < 0.02f)
+                if (_corrWeight < 0.02f && _corrPosOffset.sqrMagnitude < 1e-8f)
                     _hasCorrOffset = false;
                 else
                     ApplyCorrectionOffset(ref target);
@@ -1710,6 +1991,15 @@ namespace PurrNet
                     $"pos={DebugPos(target)}");
             }
 
+            if (_hasLastAdaptiveOutput && !_hasCorrOffset && _renderRel >= maxAhead &&
+                _seamOffset.Equals(Vector3.zero) && target.Equals(_lastAdaptiveOutput))
+            {
+                _adaptiveResting = true;
+                return false;
+            }
+
+            _lastAdaptiveOutput = target;
+            _hasLastAdaptiveOutput = true;
             state = target;
             return true;
         }
@@ -1722,6 +2012,11 @@ namespace PurrNet
                 var op = old.data.position.Value;
                 var tp = target.data.position.Value;
                 posDelta = new Vector3(op.x.value - tp.x.value, op.y.value - tp.y.value, op.z.value - tp.z.value);
+            }
+            else if (old.data.absolutePosition.HasValue && target.data.absolutePosition.HasValue)
+            {
+                var d = old.data.absolutePosition.Value - target.data.absolutePosition.Value;
+                posDelta = new Vector3((float)d.x, (float)d.y, (float)d.z);
             }
 
             var oRot = old.data.rotation;
@@ -1736,9 +2031,16 @@ namespace PurrNet
 
             if (_hasCorrOffset)
             {
-                posDelta += _corrPosOffset * _corrWeight;
+                posDelta += _corrPosOffset;
                 rotDelta = Quaternion.Slerp(Quaternion.identity, _corrRotOffset, _corrWeight) * rotDelta;
                 scaleDelta += _corrScaleOffset * _corrWeight;
+            }
+
+            if (posDelta.sqrMagnitude > MAX_SEAM_DISTANCE * MAX_SEAM_DISTANCE)
+            {
+                _hasCorrOffset = false;
+                _hasCorrPrevTarget = false;
+                return;
             }
 
             _corrPosOffset = posDelta;
@@ -1750,13 +2052,69 @@ namespace PurrNet
             _hasCorrOffset = true;
         }
 
+        // Beyond this seam size the pose is treated as an intentional teleport and snaps instead.
+        private const float MAX_SEAM_DISTANCE = 10f;
+
+        private void SeedSeamCorrection(in NetworkTransformState state, Transform p)
+        {
+            if (!syncPosition)
+                return;
+
+            Vector3 posOffset;
+
+            if (state.data.absolutePosition.HasValue)
+            {
+                if (!TryResolvePositionTransform(out var frame))
+                    return;
+
+                var d = frame.ToAbsolute(this, position) - state.data.absolutePosition.Value;
+                posOffset = new Vector3((float)d.x, (float)d.y, (float)d.z);
+            }
+            else if (state.data.position.HasValue)
+            {
+                bool isLocal = _syncPosition == SyncMode.Local && p;
+                var renderedPos = isLocal ? p.InverseTransformPoint(position) : position;
+                var sp = state.data.position.Value;
+                posOffset = renderedPos - new Vector3(sp.x.value, sp.y.value, sp.z.value);
+            }
+            else
+            {
+                return;
+            }
+
+            if (posOffset.sqrMagnitude > MAX_SEAM_DISTANCE * MAX_SEAM_DISTANCE)
+                return;
+
+            var renderedRot = _syncRotation == SyncMode.Local && p
+                ? Quaternion.Inverse(p.rotation) * rotation
+                : rotation;
+            var tr = state.data.rotation;
+            var rotOffset = renderedRot *
+                            Quaternion.Inverse(new Quaternion(tr.x, tr.y, tr.z, tr.w).normalized);
+
+            _corrPosOffset = posOffset;
+            _corrRotOffset = rotOffset;
+            _corrScaleOffset = Vector3.zero;
+            _corrWeight = 1f;
+            _corrFrame = state.frame;
+            _corrParentId = state.parentId;
+            _hasCorrOffset = true;
+            _hasCorrPrevTarget = false;
+        }
+
         private void ApplyCorrectionOffset(ref NetworkTransformState target)
         {
             if (target.data.position.HasValue && _corrPosOffset != Vector3.zero)
             {
                 var p = target.data.position.Value;
-                var pos = new Vector3(p.x.value, p.y.value, p.z.value) + _corrPosOffset * _corrWeight;
+                var pos = new Vector3(p.x.value, p.y.value, p.z.value) + _corrPosOffset;
                 target.data.position = (CompressedVector3)pos;
+            }
+            else if (target.data.absolutePosition.HasValue && _corrPosOffset != Vector3.zero)
+            {
+                var ap = target.data.absolutePosition.Value;
+                target.data.absolutePosition = new double3(
+                    ap.x + _corrPosOffset.x, ap.y + _corrPosOffset.y, ap.z + _corrPosOffset.z);
             }
 
             if (Mathf.Abs(_corrRotOffset.w) < 0.9999999f)
@@ -1853,6 +2211,8 @@ namespace PurrNet
 
         private void TeleportBuffers(in NetworkTransformState state, Transform p)
         {
+            _resting = false;
+
             if (syncPosition)
                 _position.Teleport(MakePositionSample(p, state.data));
 
@@ -1865,6 +2225,8 @@ namespace PurrNet
 
         private void AddStateToBuffers(in NetworkTransformState state, Transform p)
         {
+            _resting = false;
+
             if (syncPosition)
                 _position.Add(MakePositionSample(p, state.data));
 
@@ -1913,22 +2275,31 @@ namespace PurrNet
             }
 
             var parentIdentity = _cachedParentIdentity;
+            NetworkTransformFrame frame;
+            NetworkID parentId;
 
             if (_syncParent && parentIdentity && parentIdentity.isSpawned && parentIdentity.id.HasValue)
             {
-                _latestFrame = NetworkTransformFrame.LocalIdentity;
-                _latestParentId = parentIdentity.id.Value;
+                frame = NetworkTransformFrame.LocalIdentity;
+                parentId = parentIdentity.id.Value;
             }
             else
             {
-                _latestFrame = p ? NetworkTransformFrame.LocalStatic : NetworkTransformFrame.World;
-                _latestParentId = default;
+                frame = p ? NetworkTransformFrame.LocalStatic : NetworkTransformFrame.World;
+                parentId = default;
             }
+
+            if (frame == _latestFrame && parentId.Equals(_latestParentId))
+                return;
+
+            _latestFrame = frame;
+            _latestParentId = parentId;
+            _latestDirty = true;
         }
 
         private const int CAPTURE_HISTORY_SIZE = 32;
 
-        private NetworkTransformState[] _historyStates;
+        [System.NonSerialized] private NetworkTransformState[] _historyStates;
         private ushort[] _historyTicks;
         private bool[] _historyUsed;
 
@@ -2018,9 +2389,28 @@ namespace PurrNet
                 _hasCapturedState = true;
             }
 
-            if (!recordHistory)
-                return;
+            if (recordHistory)
+                RecordCapturedHistory(tick);
+        }
 
+        internal void GatherAndCapture(ushort tick)
+        {
+            RefreshLatestFrame();
+
+            if (_hasCapturedState && !_latestDirty)
+            {
+                RecordCapturedHistory(tick);
+                return;
+            }
+
+            _latestDirty = false;
+            GatherState();
+            CaptureUnreliableState(tick, true);
+            DeltaSave();
+        }
+
+        private void RecordCapturedHistory(ushort tick)
+        {
             if (_historyStates == null)
             {
                 _historyStates = ArrayPool<NetworkTransformState>.Shared.Rent(CAPTURE_HISTORY_SIZE);
@@ -2072,6 +2462,7 @@ namespace PurrNet
 
         private void RefreshCurrentState()
         {
+            InvalidateLatest();
             _currentData = GetCurrentTransformData();
             _latestData = _currentData;
             RefreshLatestFrame();
@@ -2081,6 +2472,7 @@ namespace PurrNet
 
         private void AdoptState(in NetworkTransformState state)
         {
+            InvalidateLatest();
             _hasLastAppliedState = false;
             ClearAdaptiveAnchors();
             _lastReadData = state.data;
@@ -2111,6 +2503,7 @@ namespace PurrNet
 
         private void TeleportToState(in NetworkTransformState state)
         {
+            _resting = false;
             var p = ResolveFrameParent(state);
 
             if (syncPosition)
@@ -2381,18 +2774,39 @@ namespace PurrNet
             _lastAppliedState = state;
             _lastAppliedSenderTick = senderTick;
             _hasLastAppliedState = true;
+            bool hadLivePose = _hasLivePose;
+            _hasLivePose = true;
 
             if (_hasStrategy)
             {
                 if (isAbsolute)
                 {
-                    ClearAdaptiveAnchors();
-                    SetAdaptiveAnchor(state, default);
-                    TeleportBuffers(state, p);
+                    // Mid-stream absolutes (ownership change, stream reset, baseline recovery)
+                    // blend instead of teleporting.
+                    bool smooth = hadLivePose;
+
+                    if (!smooth)
+                    {
+                        ClearAdaptiveAnchors();
+                        SetAdaptiveAnchor(state, default);
+                        TeleportBuffers(state, p);
+                    }
+                    else if (_hasAdaptiveAnchor)
+                    {
+                        SetAdaptiveAnchor(state, default);
+                    }
+                    else
+                    {
+                        SeedSeamCorrection(state, p);
+                        SetAdaptiveAnchor(state, default);
+                        _corrPending = false;
+                        _hasPrevAnchor = false;
+                        _hasRenderTimeline = false;
+                    }
 
                     if (_adaptiveDebugDump)
                         DebugDumpLine($"apply,senderTick={senderTick},abs=True,order={packetOrder}," +
-                                      $"pos={DebugPos(state)}");
+                                      $"smooth={smooth},pos={DebugPos(state)}");
                 }
                 else
                 {

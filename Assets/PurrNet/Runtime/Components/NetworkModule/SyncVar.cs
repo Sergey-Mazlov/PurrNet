@@ -2,6 +2,7 @@ using UnityEngine;
 using PurrNet.Logging;
 using PurrNet.Modules;
 using System;
+using System.Runtime.CompilerServices;
 using JetBrains.Annotations;
 using PurrNet.Packing;
 using PurrNet.Transports;
@@ -10,7 +11,7 @@ using PurrNet.Utils;
 namespace PurrNet
 {
     [Serializable]
-    public class SyncVar<T> : NetworkModule, ISerializationCallbackReceiver
+    public class SyncVar<T> : NetworkModule, ISerializationCallbackReceiver, ITickListener
     {
         private TickManager _tickManager;
 
@@ -21,9 +22,13 @@ namespace PurrNet
         [SerializeField, Space(-5), Header("Sync Settings"), PurrLock]
         private bool _ownerAuth;
 
+        [SerializeField, PurrLock] private bool _ownerOnly;
+
         [SerializeField, Min(0)] private float _sendIntervalInSeconds;
 
         public bool ownerAuth => _ownerAuth;
+
+        public override bool ownerOnly => _ownerOnly;
 
         public float sendIntervalInSeconds
         {
@@ -47,7 +52,15 @@ namespace PurrNet
             get => _value;
             set
             {
-                if (PurrEquality<T>.Default.Equals(value, _value))
+                ulong? hash = null;
+
+                if (_hashValue)
+                {
+                    _valueHash ??= HashValue(_value);
+                    hash = HashValue(value);
+                }
+
+                if (hash == _valueHash && PurrEquality<T>.Default.Equals(value, _value))
                     return;
 
                 if (isSpawned && !isControllingSyncVar)
@@ -64,6 +77,7 @@ namespace PurrNet
 
                 var oldValue = _value;
                 _value = value;
+                _valueHash = hash;
                 _ignoreServerUpdates = true;
 
                 SetDirty();
@@ -78,9 +92,11 @@ namespace PurrNet
             isControllingSyncVar = false;
             _isDirty = false;
             _wasLastDirty = false;
+            _sentLastTick = false;
             _id = 0;
             _ignoreServerUpdates = false;
             _value = _initialValue;
+            _valueHash = null;
         }
 
         public override void OnOwnerDisconnected(PlayerID ownerId)
@@ -122,7 +138,7 @@ namespace PurrNet
 
             _isSubscribedToTickManager = true;
             _subscribedTicker = networkManager.tickModule;
-            _subscribedTicker.onTick += OnTick;
+            _subscribedTicker.AddTickListener(this);
         }
 
         private void UnsubscribeFromTickManager()
@@ -131,12 +147,13 @@ namespace PurrNet
                 return;
 
             _isSubscribedToTickManager = false;
-            _subscribedTicker.onTick -= OnTick;
+            _subscribedTicker.RemoveTickListener(this);
         }
 
         public override void OnInitializeModules()
         {
             InvalidateIsController();
+            UpdateValueHash();
         }
 
         public override void OnEarlySpawn()
@@ -192,6 +209,7 @@ namespace PurrNet
             finally
             {
                 _wasLastDirty = false;
+                _sentLastTick = false;
                 _isDirty = false;
                 UnsubscribeFromTickManager();
             }
@@ -227,6 +245,7 @@ namespace PurrNet
             ForceSendReliable();
             _lastSendTime = Time.time;
             _wasLastDirty = false;
+            _sentLastTick = false;
             _isDirty = false;
             UnsubscribeFromTickManager();
         }
@@ -247,38 +266,82 @@ namespace PurrNet
                 float time = Time.time;
 
                 if (time - _lastSendTime < _sendIntervalInSeconds)
+                {
+                    _sentLastTick = false;
                     return;
+                }
 
-                ForceSendUnreliable();
+                if (_sentLastTick)
+                {
+                    ForceSendUnreliable();
+                    _wasLastDirty = true;
+                }
+                else
+                {
+                    ForceSendReliable();
+                    _wasLastDirty = false;
+                }
+
                 _lastSendTime = time;
-                _wasLastDirty = true;
+                _sentLastTick = true;
                 _isDirty = false;
             }
-            else if (_wasLastDirty)
+            else
             {
-                ForceSendReliable();
+                _sentLastTick = false;
+
+                if (_wasLastDirty)
+                {
+                    ForceSendReliable();
+                    _wasLastDirty = false;
+                }
+
                 UnsubscribeFromTickManager();
-                _wasLastDirty = false;
             }
         }
 
         private ulong _id;
+
         private bool _wasLastDirty;
+
+        private bool _sentLastTick;
+
         [SerializeField, HideInInspector]
         private T _initialValue;
 
-        public SyncVar(T initialValue = default, float sendIntervalInSeconds = 0f, bool ownerAuth = false)
+        private static readonly bool _hashValue = RuntimeHelpers.IsReferenceOrContainsReferences<T>() && typeof(T) != typeof(string);
+
+        private ulong? _valueHash;
+
+        private static ulong HashValue(T value)
+        {
+            using var packer = BitPackerPool.Get();
+            Packer<T>.Write(packer, value);
+            return packer.GetDeterministicHash64();
+        }
+
+        private void UpdateValueHash()
+        {
+            if (_hashValue)
+                _valueHash = HashValue(_value);
+        }
+
+        public SyncVar(T initialValue = default, float sendIntervalInSeconds = 0f, bool ownerAuth = false, bool ownerOnly = false)
         {
             _initialValue = initialValue;
             _value = initialValue;
             _sendIntervalInSeconds = sendIntervalInSeconds;
             _ownerAuth = ownerAuth;
+            _ownerOnly = ownerOnly;
         }
 
         [TargetRpc, UsedImplicitly]
         private void SendLatestState(PlayerID player, PackedULong packetId, T newValue)
         {
             if (isServer)
+                return;
+
+            if (packetId.value < _id)
                 return;
 
             if (_ignoreServerUpdates)
@@ -295,6 +358,7 @@ namespace PurrNet
             if (!Packer.Transform(ref _value, newValue))
                 return;
 
+            UpdateValueHash();
             TriggerEvents(oldValue);
         }
 
@@ -360,6 +424,7 @@ namespace PurrNet
             if (!Packer.Transform(ref _value, newValue))
                 return;
 
+            UpdateValueHash();
             TriggerEvents(oldValue);
         }
 

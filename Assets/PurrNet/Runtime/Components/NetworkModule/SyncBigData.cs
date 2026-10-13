@@ -15,6 +15,7 @@ namespace PurrNet
         public PackedUInt id;
         public PlayerID player;
         public int sentPartsCount;
+        public float firstPartSentTime;
         public DisposableList<int> confirmedParts;
         public DisposableList<int> requestedParts;
     }
@@ -45,7 +46,12 @@ namespace PurrNet
     {
         [SerializeField] private SyncStatus _syncStatus;
         [SerializeField, PurrLock] private bool _ownerAuth;
+
+        [SerializeField, PurrLock] private bool _ownerOnly;
+
+        public override bool ownerOnly => _ownerOnly;
         [SerializeField, Min(1)] private int _maxKBPerSec;
+        [SerializeField, Min(1)] private int _maxSizeMB;
 
         private List<BigDataState> _pending = new ();
 
@@ -66,6 +72,8 @@ namespace PurrNet
 
         /// <summary>
         /// Download progress, between 0 and 1.
+        /// On the peer that called <see cref="SetData"/> this is 1 straight away; it tracks the
+        /// local copy, not how much of it the other peers have received yet.
         /// </summary>
         public float progress => _syncStatus.percent;
 
@@ -74,19 +82,40 @@ namespace PurrNet
 
         private byte[] _uncompressedData;
         private byte[] _compressedData;
-        private const int PART_SIZE = 1000;
+
+        private const int PART_SIZE = 768;
+        private const float FIRST_PART_RESEND_INTERVAL = 1f;
+        private const int MAX_PENDING_REQUESTS = 512;
+        private const int DEFAULT_MAX_SIZE_MB = 512;
+
         private int _totalParts;
 
         public int maxKBPerSec
         {
-            get => _maxKBPerSec;
+            get => Mathf.Max(1, _maxKBPerSec);
             set => _maxKBPerSec = Mathf.Max(1, value);
         }
 
-        public SyncBigData(bool ownerAuth = false, int maxKBPerSec = 15)
+        /// <summary>
+        /// Largest data this module will send or accept, in megabytes.
+        /// Applies to both the compressed transfer and the uncompressed result.
+        /// </summary>
+        public int maxSizeMB
+        {
+            get => _maxSizeMB > 0 ? _maxSizeMB : DEFAULT_MAX_SIZE_MB;
+            set => _maxSizeMB = Mathf.Max(1, value);
+        }
+
+        private long maxSizeBytes => maxSizeMB * 1024L * 1024L;
+
+        private float partsPerSecond => maxKBPerSec * 1000f / PART_SIZE;
+
+        public SyncBigData(bool ownerAuth = false, int maxKBPerSec = 15, bool ownerOnly = false)
         {
             _ownerAuth = ownerAuth;
+            _ownerOnly = ownerOnly;
             _maxKBPerSec = Mathf.Max(1, maxKBPerSec);
+            _maxSizeMB = DEFAULT_MAX_SIZE_MB;
         }
 
         public override void OnOwnerChanged(PlayerID? oldOwner, PlayerID? newOwner, bool asServer)
@@ -125,6 +154,13 @@ namespace PurrNet
                 return;
             }
 
+            if (data.Length > maxSizeBytes)
+            {
+                PurrLogger.LogError(
+                    $"Data of {data.Length} bytes exceeds the {maxSizeMB} MB limit of `<b>{GetType().Name} {name}</b>`.", parent);
+                return;
+            }
+
             ++_nextId;
             _syncStatus = default;
             _receivingState = default;
@@ -142,8 +178,12 @@ namespace PurrNet
                 _totalParts = 0;
             }
 
+            _syncStatus = new SyncStatus { percent = 1f, isDone = true };
+
             OnDataReady();
             ReQueueEveryone();
+
+            onSyncStatusChanged?.Invoke(_syncStatus);
         }
 
         private uint _nextId;
@@ -181,9 +221,11 @@ namespace PurrNet
 
             if (isServer)
             {
-                for (var i = parent.observers.Count - 1; i >= 0; i--)
+                var targets = observers;
+
+                for (var i = targets.Count - 1; i >= 0; i--)
                 {
-                    var observer = parent.observers[i];
+                    var observer = targets[i];
 
                     if (observer == localPlayer || (_ownerAuth && observer == owner))
                         continue;
@@ -232,7 +274,7 @@ namespace PurrNet
             if (_syncStatus is { percent: > 0, isDone: false })
             {
                 float timeSinceLastPart = Time.unscaledTime - _receivingState.timeSinceLastReceivedPart;
-                float expectedPerTick = _maxKBPerSec * delta;
+                float expectedPerTick = partsPerSecond * delta;
                 float minTimeToPart = 1f / expectedPerTick;
 
                 if (timeSinceLastPart > minTimeToPart * 3)
@@ -245,7 +287,7 @@ namespace PurrNet
             if (_pending == null || _pending.Count == 0)
                 return;
 
-            _partsCounter += _maxKBPerSec * delta;
+            _partsCounter += partsPerSecond * delta;
 
             if (_partsCounter < 1)
                 return;
@@ -254,19 +296,21 @@ namespace PurrNet
             {
                 var state = _pending[i];
 
-                bool isFirst = state.sentPartsCount == 0;
-
-                if (isFirst)
-                {
-                    SendDownloadStart(ref state);
-                    _pending[i] = state;
-                    continue;
-                }
-
                 bool hasFirstPart = state.confirmedParts.Count > 0;
 
                 if (!hasFirstPart)
+                {
+                    bool neverSent = state.sentPartsCount == 0;
+                    bool timedOut = Time.unscaledTime - state.firstPartSentTime > FIRST_PART_RESEND_INTERVAL;
+
+                    if (neverSent || timedOut)
+                    {
+                        SendDownloadStart(ref state);
+                        _pending[i] = state;
+                    }
+
                     continue;
+                }
 
                 int partsBudget = (int)_partsCounter;
                 SendNewParts(ref partsBudget, ref state);
@@ -337,7 +381,7 @@ namespace PurrNet
             HandlePending(parts, PlayerID.Server);
         }
 
-        [ServerRpc(Channel.Unreliable)]
+        [ServerRpc(Channel.Unreliable, requireOwnership: false)]
         private void RequestMissingParts(DisposableList<Size> parts, RPCInfo info = default)
         {
             HandlePending(parts, info.sender);
@@ -347,6 +391,9 @@ namespace PurrNet
         {
             using (parts)
             {
+                if (_pending == null)
+                    return;
+
                 for (int i = _pending.Count - 1; i >= 0; i--)
                 {
                     var v = _pending[i];
@@ -354,7 +401,14 @@ namespace PurrNet
                     {
                         for (var p = 0; p < parts.Count; p++)
                         {
-                            var part = parts[p];
+                            if (v.requestedParts.Count >= MAX_PENDING_REQUESTS)
+                                break;
+
+                            int part = parts[p];
+
+                            if (part < 0 || part >= _totalParts)
+                                continue;
+
                             if (!v.requestedParts.Contains(part))
                                 v.requestedParts.Add(part);
                         }
@@ -432,10 +486,17 @@ namespace PurrNet
 
         private void SendDownloadStart(ref BigDataState state)
         {
+            if (_compressedData == null)
+                return;
+
+            state.firstPartSentTime = Time.unscaledTime;
+
             if (isServer)
                  SendFirstPart(state.player, state.id, GetDataPart(0), _totalParts, _compressedData.Length);
             else SendFirstPartToServer(state.id, GetDataPart(0), _totalParts, _compressedData.Length);
-            state.sentPartsCount++;
+
+            if (state.sentPartsCount == 0)
+                state.sentPartsCount = 1;
         }
 
         [ServerRpc]
@@ -444,7 +505,9 @@ namespace PurrNet
             if (!_ownerAuth || !owner.HasValue)
                 return;
 
-            HandleFirstPart(tid, data, totalParts, totalLength);
+            if (!HandleFirstPart(tid, data, totalParts, totalLength))
+                return;
+
             ConfirmFirstPartWithOwner(owner.Value);
             ReQueueEveryone();
         }
@@ -452,12 +515,28 @@ namespace PurrNet
         [TargetRpc]
         private void SendFirstPart(PlayerID player, PackedUInt tid, ByteData data, int totalParts, int totalLength)
         {
-            HandleFirstPart(tid, data, totalParts, totalLength);
-            ConfirmFirstPart();
+            if (HandleFirstPart(tid, data, totalParts, totalLength))
+                ConfirmFirstPart();
         }
 
-        private void HandleFirstPart(PackedUInt tid, ByteData data, int totalParts, int totalLength)
+        private bool HandleFirstPart(PackedUInt tid, ByteData data, int totalParts, int totalLength)
         {
+            if (totalLength < 0 || totalLength > maxSizeBytes)
+            {
+                PurrLogger.LogError(
+                    $"Rejected {totalLength} bytes for `<b>{GetType().Name} {name}</b>`, the limit is {maxSizeMB} MB.", parent);
+                return false;
+            }
+
+            if (_receivingState.id == tid && !_receivingState.confirmedParts.isDisposed)
+            {
+                InsertConfirmedPart(data, 0);
+                return true;
+            }
+
+            if (!_receivingState.confirmedParts.isDisposed)
+                _receivingState.confirmedParts.Dispose();
+
             _receivingState = new BigDataReceiveState
             {
                 id = tid,
@@ -466,6 +545,7 @@ namespace PurrNet
                 confirmedParts = DisposableList<int>.Create()
             };
 
+            _nextId = tid;
             _totalParts = totalParts;
 
             if (_compressedData == null)
@@ -474,9 +554,10 @@ namespace PurrNet
                 Array.Resize(ref _compressedData, totalLength);
 
             InsertConfirmedPart(data, 0);
+            return true;
         }
 
-        [ServerRpc(channel: Channel.Unreliable)]
+        [ServerRpc(channel: Channel.Unreliable, mtuExceeded: MTUBehaviour.Fragment)]
         private void SendPartToServer(PackedUInt id, ByteData data, int partId)
         {
             if (_receivingState.id != id)
@@ -484,7 +565,7 @@ namespace PurrNet
             InsertConfirmedPart(data, partId);
         }
 
-        [TargetRpc(channel: Channel.Unreliable)]
+        [TargetRpc(channel: Channel.Unreliable, mtuExceeded: MTUBehaviour.Fragment)]
         private void SendPartToTarget(PlayerID player, PackedUInt id, ByteData data, int partId)
         {
             if (_receivingState.id != id)
@@ -525,8 +606,19 @@ namespace PurrNet
 
             if (syncStatus.isDone)
             {
-                _uncompressedData = LZ4Pickler.Unpickle(_compressedData);
-                OnDataReady();
+                int uncompressedLength = LZ4Pickler.UnpickledSize(_compressedData);
+                if (uncompressedLength > maxSizeBytes)
+                {
+                    PurrLogger.LogError(
+                        $"Rejected {uncompressedLength} bytes for `<b>{GetType().Name} {name}</b>`, the limit is {maxSizeMB} MB.", parent);
+                    _receivingState.confirmedParts.Dispose();
+                    syncStatus = default;
+                }
+                else
+                {
+                    _uncompressedData = LZ4Pickler.Unpickle(_compressedData);
+                    OnDataReady();
+                }
             }
             onSyncStatusChanged?.Invoke(syncStatus);
         }
@@ -573,7 +665,8 @@ namespace PurrNet
 
         static void ConfirmFirstEntry(ref BigDataState entry)
         {
-            entry.confirmedParts.Add(0);
+            if (!entry.confirmedParts.Contains(0))
+                entry.confirmedParts.Add(0);
         }
     }
 }
